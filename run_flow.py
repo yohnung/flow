@@ -14,16 +14,20 @@ from optimization import AdamWeightDecayOptimizer
 import os
 import json
 import numpy as np
+import collections
+import re
 
-flags.DEFINE_float("flow_learning_rate", 3e-3, "Initial learning rate for Adam.")
+flags.DEFINE_float("flow_learning_rate", 4e-5, "Initial learning rate for Adam.")
 flags.DEFINE_string("flow_model_config", "config_l3_d3_w32", None)
 flags.DEFINE_boolean("do_train", None, "if train flow's parameter")
-flags.DEFINE_boolean("init_checkpoint", None, None)
 flags.DEFINE_string("data_dir", None, None)
-flags.DEFINE_integer("data_repeat_times", 10, None)
-flags.DEFINE_integer("batch_size", 8192, None)
-flags.DEFINE_integer("num_train_steps", 100000, None)
-flags.DEFINE_integer("num_warmup_steps", 1000, None)
+flags.DEFINE_boolean("do_predict", None, None)
+flags.DEFINE_string("test_file", None, None)
+flags.DEFINE_string("init_checkpoint", None, None)
+flags.DEFINE_integer("data_repeat_times", 1, None)
+flags.DEFINE_integer("batch_size", 1024, None)
+flags.DEFINE_integer("num_train_steps", 2000, None)
+flags.DEFINE_integer("num_warmup_steps", 300, None)
 
 emb_dim = 256
 
@@ -157,7 +161,7 @@ def map2embedding_fn(string_line):
   return embedding
 
 # read embedding from file, and makes it a tensoflow variable
-def input_embedding(gpu_size, gpu_num):
+def input_embedding(gpu_size=1, gpu_id=0, mode=tf.estimator.ModeKeys.PREDICT):
   try:
     file_list = os.listdir(FLAGS.data_dir)
     file_dir = FLAGS.data_dir
@@ -167,86 +171,122 @@ def input_embedding(gpu_size, gpu_num):
   files = []
   for file_id, file_name in enumerate(file_list):
     file_name = os.path.join(file_dir, file_name)
-    if file_id % gpu_size == gpu_num:
+    if file_id % gpu_size == gpu_id:
       files.append(file_name)
+  if mode == tf.estimator.ModeKeys.PREDICT:
+    files=[FLAGS.test_file]
   
-  train_data_set = tf.data.TextLineDataset(files)\
-                            .repeat(FLAGS.data_repeat_times)\
-                            .shuffle(100*FLAGS.batch_size,reshuffle_each_iteration=True)\
-                            .batch(FLAGS.batch_size)
+  if mode == tf.estimator.ModeKeys.TRAIN:
+    train_data_set = tf.data.TextLineDataset(files)\
+                              .repeat(FLAGS.data_repeat_times)\
+                              .shuffle(100*FLAGS.batch_size,reshuffle_each_iteration=True)\
+                              .batch(FLAGS.batch_size)
+  if mode == tf.estimator.ModeKeys.PREDICT:
+    train_data_set = tf.data.TextLineDataset(files)\
+                              .batch(FLAGS.batch_size, drop_remainder = False)
   train_data_set = train_data_set.map(map2embedding_fn, num_parallel_calls=4)
   iterator = train_data_set.make_one_shot_iterator()
   batch_data = iterator.get_next()
-  return batch_data
-
+  return (batch_data, None)
 
 def get_flow_loss(embedding, is_training):
-	with open(os.path.join("./flow/config", FLAGS.flow_model_config + ".json"), 'r')as jp:
-		flow_model_config = AttrDict(json.load(jp))
-	flow_model_config.is_training = is_training
-	flow_model = Glow(flow_model_config)
-	flow_loss_example = flow_model.body(embedding, is_training)	# no l2 normalization here any more
-	flow_loss_batch = tf.reduce_mean(flow_loss_example)
-	embedding = tf.identity(tf.squeeze(flow_model.z, [1,2]))
+  with open(os.path.join("./flow/config", FLAGS.flow_model_config + ".json"), 'r')as jp:
+    flow_model_config = AttrDict(json.load(jp))
+  flow_model_config.is_training = is_training
+  flow_model = Glow(flow_model_config)
+  flow_loss_example = flow_model.body(embedding, is_training)  # no l2 normalization here any more
+  flow_loss_batch = tf.reduce_mean(flow_loss_example)
+  embedding = tf.identity(tf.squeeze(flow_model.z, [1,2]))
 
-	return embedding, flow_loss_example, flow_loss_batch
+  return embedding, flow_loss_example, flow_loss_batch
 
-def create_model(input_embeddings, is_training):
+def create_model(features, labels, mode, params):
+  input_embeddings = features
 
-	embeddings, flow_loss_example, flow_loss_batch = get_flow_loss(input_embeddings, True)
+  is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-	return flow_loss_batch 
-	
+  with tf.variable_scope("flow") as scope:
+    embeddings, flow_loss_example, flow_loss_batch = get_flow_loss(input_embeddings, True)
+
+  tvars = tf.trainable_variables()
+  initialized_variable_names = {}
+  if FLAGS.init_checkpoint:
+    (assignment_map, initialized_variable_names
+    ) = get_assignment_map_from_checkpoint(tvars, FLAGS.init_checkpoint)
+    tf.train.init_from_checkpoint(FLAGS.init_checkpoint, assignment_map)
+  
+  tf.logging.info("****** Trainable Variables ******")
+  for var in tvars:
+    init_string = ""
+    if var.name in initialized_variable_names:
+      init_string = ", *INIT_FROM_CKPT*"
+    tf.logging.info(" name = %s, shape = %s%s", var.name, var.shape, init_string)
+
+  if is_training:
+    return embeddings, flow_loss_batch 
+  if mode == tf.estimator.ModeKeys.PREDICT:
+    output_spec = tf.estimator.EstimatorSpec(
+      mode = mode,
+      predictions = {"embeddings": embeddings})
+    return output_spec
+  
 
 def main(_):
-	tf.logging.set_verbosity(tf.logging.INFO)
+  tf.logging.set_verbosity(tf.logging.INFO)
 
-	hvd.init()
-	
-	config = tf.ConfigProto()
-	config.gpu_options.visible_device_list = str(hvd.local_rank())
-	config.gpu_options.allow_growth = True
+  hvd.init()
+  
+  config = tf.ConfigProto()
+  config.gpu_options.visible_device_list = str(hvd.local_rank())
+  config.gpu_options.allow_growth = True
+  if hvd.rank() != 0:
+    model_dir = None
+  else:
+    model_dir = './results'
 
-	if FLAGS.do_train:
-		tf.logging.info("****** Training Flow ******")
-		embeddings = input_embedding(hvd.size(), hvd.rank())
-		with tf.variable_scope("flow") as scope:
-			flow_loss = create_model(embeddings, True)
+  run_config = tf.estimator.RunConfig(
+    session_config=config,
+    model_dir=model_dir)
+  estimator = tf.estimator.Estimator(
+    model_fn=create_model,
+    config=run_config)
 
-		learning_rate = FLAGS.flow_learning_rate
-		global_step = tf.train.get_or_create_global_step()
+  if FLAGS.do_predict:
+    tf.logging.info("****** Predict using flow ******")
+    results = estimator.predict(input_fn = input_embedding)
 
-		train_op = create_optimizer(flow_loss, learning_rate, FLAGS.num_train_steps, FLAGS.num_warmup_steps)
+    output_predict_file = os.path.join(model_dir, FLAGS.test_file.split('/')[-1].replace(".emb.dat", ".post.emb.dat"))
+    with open(FLAGS.test_file) as f:
+      predict_examples = f.readlines()
 
-		tvars = tf.trainable_variables()
-		initialized_variable_names = {}
-		if FLAGS.init_checkpoint:
-			(assignment_map, initialized_variable_names
-			) = get_assignment_map_from_chekpoint(tvars, FLAGS.init_checkpoint)
-			tf.train.init_from_checkpoint(FLAGS.init_checkpoint, assignment_map)
+    with tf.gfile.GFile(output_predict_file, "w") as pred_writer:
+      num_written_lines = 0
+      tf.logging.info("****** Predicting ******")
+      for (i, (example, prediction)) in enumerate(zip(predict_examples, results)):
+        ss = prediction["embeddings"]
+        pred_writer.write('\t'.join(example.strip().split('\t')[:-1]) + '\t' + ' '.join(str(x) for x in ss) + '\n')
+        num_written_lines += 1
 
-		tf.logging.info("****** Trainable Variables ******")
-		for var in tvars:
-			init_string = ""
-			if var.name in initialized_variable_names:
-				init_string = ", *INIT_FROM_CKPT*"
-			tf.logging.info(" name = %s, shape = %s%s", var.name, var.shape, init_string)
+  if FLAGS.do_train:
+    tf.logging.info("****** Training Flow ******")
+    embeddings, _ = input_embedding(hvd.size(), hvd.rank(), tf.estimator.ModeKeys.TRAIN)
+    _, flow_loss = create_model(embeddings, None, tf.estimator.ModeKeys.TRAIN, None)
 
-		hooks=[hvd.BroadcastGlobalVariablesHook(0), tf.train.StopAtStepHook(last_step=10000000 // hvd.size())]
-		if hvd.rank() != 0:
-			model_dir = None
-		else:
-			model_dir = './results'
+    learning_rate = FLAGS.flow_learning_rate
+    global_step = tf.train.get_or_create_global_step()
 
+    train_op = create_optimizer(flow_loss, learning_rate, FLAGS.num_train_steps, FLAGS.num_warmup_steps)
 
-		with tf.train.MonitoredTrainingSession(checkpoint_dir=model_dir, hooks=hooks, config=config,
-                      save_checkpoint_steps=10000, save_summaries_steps=1000) as ms:
-			while not ms.should_stop():
-				_, mgs = ms.run([train_op, global_step])
-	
-	return
-				
+    hooks=[hvd.BroadcastGlobalVariablesHook(0), tf.train.StopAtStepHook(last_step=FLAGS.num_train_steps // hvd.size())]
+
+    with tf.train.MonitoredTrainingSession(checkpoint_dir=model_dir, hooks=hooks, config=config,
+                      save_checkpoint_steps=300, save_summaries_steps=30) as ms:
+      while not ms.should_stop():
+        _, mgs = ms.run([train_op, global_step])
+  
+  return
+        
 if __name__ == '__main__':
-	flags.mark_flag_as_required("data_dir")
-	flags.mark_flag_as_required("do_train")
-	tf.app.run()
+  flags.mark_flag_as_required("data_dir")
+  flags.mark_flag_as_required("do_train")
+  tf.app.run()
